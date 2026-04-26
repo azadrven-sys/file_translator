@@ -1,1 +1,1 @@
-Use -help for help text
+Use `-help` for help text.
