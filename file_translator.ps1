@@ -168,7 +168,7 @@ VARSAYILANLAR:
 PERFORMANS:
     Benzersiz stringler önbelleğe alınır; aynı metin tekrar tekrar çevrilmez.
     Çeviri işleri paralel çalışır. Paralellik sayısını değiştirmek için ortam değişkeni kullanabilirsiniz:
-        `$env:TRANSLATE_MAX_PARALLEL = '20'
+        `$env:TRANSLATE_MAX_PARALLEL = '6'
 
 Desteklenen Diller:
     Çeviri servislerinin desteklediği ISO dil kodları kullanılabilir.
@@ -298,7 +298,7 @@ PROCESSING MODEL:
 PERFORMANCE:
     Unique strings are cached, so repeated text is translated once.
     Translation jobs run in parallel. To tune parallelism, set:
-        `$env:TRANSLATE_MAX_PARALLEL = '20'
+        `$env:TRANSLATE_MAX_PARALLEL = '6'
 
 Supported Languages:
     Use ISO language codes supported by the translation providers.
@@ -547,7 +547,7 @@ function Translate-TextsInParallel {
         [string[]]$texts,
         [string]$from,
         [string]$to,
-        [int]$maxParallel = 20
+        [int]$maxParallel = 6
     )
     $map = @{}
     if (-not $texts -or $texts.Count -eq 0) { return $map }
@@ -584,18 +584,15 @@ function Translate-TextsInParallel {
                 return $chunks
             }
 
-            $out = @()
             foreach ($text in $batch) {
-                if ([string]::IsNullOrEmpty($text)) { $out += [pscustomobject]@{ Key = $text; Value = $text }; continue }
+                if ([string]::IsNullOrEmpty($text)) { Write-Output ([pscustomobject]@{ Key = $text; Value = $text }); continue }
                 $chunks = Split-LocalChunks -text $text -max 3000
                 $translatedString = ''
                 $anyFailure = $false
-                
                 foreach ($chunk in $chunks) {
                     $chunkTranslated = $null
                     $pAttempts = 0
                     while ($pAttempts -lt 2 -and -not $chunkTranslated) {
-                        # Google
                         try {
                             $sl = if ($from) { $from } else { 'auto' }
                             $q = [System.Uri]::EscapeDataString($chunk)
@@ -605,7 +602,6 @@ function Translate-TextsInParallel {
                             elseif ($resp -is [System.Array]) { foreach ($s in $resp[0]) { $chunkTranslated += $s[0] } }
                         } catch { }
 
-                        # MyMemory
                         if (-not $chunkTranslated) {
                             try {
                                 $slM = if ($from) { $from } else { 'en' }
@@ -615,7 +611,6 @@ function Translate-TextsInParallel {
                             } catch { }
                         }
 
-                        # Lingva
                         if (-not $chunkTranslated) {
                             try {
                                 $qL = [System.Uri]::EscapeDataString($chunk)
@@ -632,21 +627,39 @@ function Translate-TextsInParallel {
                     else { $anyFailure = $true; break }
                     Start-Sleep -Milliseconds (Get-Random -Minimum 200 -Maximum 500)
                 }
-                
                 $finalValue = if ($anyFailure) { $null } else { $translatedString }
-                $out += [pscustomobject]@{ Key = $text; Value = $finalValue }
+                Write-Output ([pscustomobject]@{ Key = $text; Value = $finalValue })
             }
-            return $out
         }
         $jobs += $j
     }
 
-    if ($jobs.Count -gt 0) { Wait-Job -Job $jobs | Out-Null }
-    foreach ($j in $jobs) {
-        $res = Receive-Job -Job $j -ErrorAction SilentlyContinue
-        foreach ($o in $res) { $map[$o.Key] = $o.Value }
-        Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
+    # Incrementally receive outputs from jobs to update progress
+    $receivedCount = 0
+    $total = $count
+    while ($true) {
+        $res = Receive-Job -Job $jobs -ErrorAction SilentlyContinue
+        foreach ($o in $res) {
+            if (-not $map.ContainsKey($o.Key)) { $map[$o.Key] = $o.Value; $receivedCount++ }
+        }
+
+        # Show per-file progress (Id=1) and rely on outer loop for overall files (Id=0)
+        $activity = ("Translating file (" + $($script:CurrentFileIndex) + "/" + $($script:TotalFiles) + "):") + " " + $($script:CurrentFileName)
+        $status = "Translated strings: $receivedCount / $total"
+        $percent = if ($total -gt 0) { [int]([double]$receivedCount / $total * 100) } else { 100 }
+        Write-Progress -Id 1 -Activity $activity -Status $status -PercentComplete $percent
+
+        $running = $jobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }
+        if ($running.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 300
     }
+
+    # collect any remaining results
+    $res = Receive-Job -Job $jobs -ErrorAction SilentlyContinue
+    foreach ($o in $res) { if (-not $map.ContainsKey($o.Key)) { $map[$o.Key] = $o.Value; $receivedCount++ } }
+    Write-Progress -Id 1 -Activity $activity -Status "Translated strings: $receivedCount / $total" -PercentComplete 100 -Completed
+
+    foreach ($j in $jobs) { Remove-Job -Job $j -Force -ErrorAction SilentlyContinue }
 
     return $map
 }
@@ -656,7 +669,7 @@ function Translate-TextsWithFallback {
         [string[]]$texts,
         [string]$from,
         [string]$to,
-        [int]$maxParallel = 20
+        [int]$maxParallel = 6
     )
 
     $map = Translate-TextsInParallel -texts $texts -from $from -to $to -maxParallel $maxParallel
@@ -863,6 +876,29 @@ function Reconstruct-VttContent {
     return ($parts -join "`r`n")
 }
 
+function Parse-TxtParagraphs {
+    param([string]$content)
+    $pattern = '(?s)(.*?)(\r?\n\r?\n|$)'
+    $matches = [regex]::Matches($content, $pattern)
+    $paras = @()
+    foreach ($m in $matches) {
+        $txt = $m.Groups[1].Value
+        $sep = $m.Groups[2].Value
+        $paras += [pscustomobject]@{ Text = $txt; Sep = $sep }
+    }
+    return $paras
+}
+
+function Reconstruct-TxtContent {
+    param([array]$paras)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($p in $paras) {
+        [void]$sb.Append($p.Text)
+        if ($p.Sep) { [void]$sb.Append($p.Sep) }
+    }
+    return $sb.ToString()
+}
+
 function Get-ReadableInputs {
     param([string[]]$paths)
     $items = @()
@@ -872,6 +908,7 @@ function Get-ReadableInputs {
         $isJsonNamedFile = ([IO.Path]::GetExtension($filePath).ToLower() -eq '.json')
         $isVttNamedFile = ([IO.Path]::GetExtension($filePath).ToLower() -eq '.vtt')
         $isSrtNamedFile = ([IO.Path]::GetExtension($filePath).ToLower() -eq '.srt')
+        $isTxtNamedFile = ([IO.Path]::GetExtension($filePath).ToLower() -eq '.txt')
         try {
             $bytes = [System.IO.File]::ReadAllBytes($filePath)
         } catch {
@@ -896,6 +933,7 @@ function Get-ReadableInputs {
             if ($format -eq 'unknown') {
                 if ($isVttNamedFile) { $format = 'vtt' }
                 elseif ($isSrtNamedFile) { $format = 'srt' }
+                elseif ($isTxtNamedFile) { $format = 'txt' }
                 elseif ($isJsonNamedFile) {
                     if ($candidateCount -eq 1) { Write-Warning "Okunabilir JSON değil, atlandı: $filePath" }
                     continue
@@ -931,6 +969,22 @@ function Get-ReadableInputs {
                 Cues = $parsed.Cues
                 Format = 'vtt'
             }
+            } elseif ($format -eq 'txt') {
+                $paras = Parse-TxtParagraphs -content $content
+                if (-not $paras -or $paras.Count -eq 0) {
+                    if ($candidateCount -eq 1 -or $isTxtNamedFile) { Write-Warning "TXT içeriği anlaşılamadı, atlandı: $filePath" }
+                    continue
+                }
+                $items += [pscustomobject]@{
+                    Path = $filePath
+                    Bytes = $bytes
+                    EncodingInfo = $encInfo
+                    Encoding = $enc
+                    Bom = $bom
+                    Content = $content
+                    Paragraphs = $paras
+                    Format = 'txt'
+                }
         } elseif ($format -eq 'srt') {
             $cues = Parse-SrtCues -content $content
             if (-not $cues -or $cues.Count -eq 0) {
@@ -1024,7 +1078,17 @@ if (-not $inputItems -or $inputItems.Count -eq 0) { Write-Error "Okunabilir gird
 
 $inputValueIsSingleFile = Test-InputValueIsSingleFile -pattern $InputDirectory
 
+$fileIndex = 0
+$totalFiles = $inputItems.Count
 foreach ($item in $inputItems) {
+    $fileIndex++
+    $script:CurrentFileIndex = $fileIndex
+    $script:TotalFiles = $totalFiles
+    $script:CurrentFileName = Split-Path -Path $item.Path -Leaf
+    $overallPercent = if ($totalFiles -gt 0) { [int]([double]$fileIndex / $totalFiles * 100) } else { 100 }
+    $overallStatus = ("File $fileIndex of $totalFiles") + ": " + $($script:CurrentFileName)
+    Write-Progress -Id 0 -Activity 'Translating files' -Status $overallStatus -PercentComplete $overallPercent
+
     $filePath = $item.Path
     $enc = $item.Encoding
     $bom = $item.Bom
@@ -1055,12 +1119,15 @@ foreach ($item in $inputItems) {
     } elseif ($format -in @('srt','vtt')) {
         foreach ($c in $item.Cues) { if (-not (Should-SkipTranslation $c.Text)) { $uniqueMap[$c.Text] = $true } }
         if ($uniqueMap.Keys.Count -gt 0) { $textsToTranslate = $uniqueMap.Keys }
+    } elseif ($format -eq 'txt') {
+        foreach ($p in $item.Paragraphs) { if (-not (Should-SkipTranslation $p.Text)) { $uniqueMap[$p.Text] = $true } }
+        if ($uniqueMap.Keys.Count -gt 0) { $textsToTranslate = $uniqueMap.Keys }
     }
     Write-Host "Unique strings found: $($textsToTranslate.Count)"
 
     # Translate unique texts in parallel and fill cache
     Write-Host "Fetching translations..."
-    $maxParallel = if ($env:TRANSLATE_MAX_PARALLEL) { [int]$env:TRANSLATE_MAX_PARALLEL } else { 20 }
+    $maxParallel = if ($env:TRANSLATE_MAX_PARALLEL) { [int]$env:TRANSLATE_MAX_PARALLEL } else { 6 }
     $translations = Translate-TextsWithFallback -texts $textsToTranslate -from $detected -to $OutputLanguage -maxParallel $maxParallel
     $successCount = 0
     foreach ($k in $translations.Keys) { 
@@ -1121,6 +1188,20 @@ foreach ($item in $inputItems) {
         $preamble = $enc.GetPreamble()
         $outBytes = $enc.GetBytes($outText)
         if ($preamble.Length -gt 0 -and $bom -gt 0) { $final = $preamble + $outBytes } else { $final = $outBytes }
+        } elseif ($format -eq 'txt') {
+            foreach ($p in $item.Paragraphs) {
+                $orig = $p.Text
+                $cacheKey = "$detected|$OutputLanguage|$orig"
+                $translated = $null
+                if ($translationCache.ContainsKey($cacheKey)) { $translated = $translationCache[$cacheKey] }
+                elseif ($translations.ContainsKey($orig)) { $translated = $translations[$orig] }
+                if ($null -eq $translated -and -not $SkipOnError) { Write-Error -Message "ERROR: Translation failed for paragraph: '$orig'"; exit 2 }
+                if ($null -ne $translated) { $p.Text = $translated }
+            }
+            $outText = Reconstruct-TxtContent -paras $item.Paragraphs
+            $preamble = $enc.GetPreamble()
+            $outBytes = $enc.GetBytes($outText)
+            if ($preamble.Length -gt 0 -and $bom -gt 0) { $final = $preamble + $outBytes } else { $final = $outBytes }
     } else {
         Write-Warning "Desteklenmeyen format: $format - atlandı: $filePath"
         continue
@@ -1133,5 +1214,6 @@ foreach ($item in $inputItems) {
         Write-Warning "Dosya yazılamadı: $outPath"
     }
 }
+Write-Progress -Id 0 -Activity 'Translating files' -Completed
 
 if ($showHelpAfter) { Show-Help -lang $helpLang }
